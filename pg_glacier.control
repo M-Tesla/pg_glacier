@@ -1,0 +1,4 @@
+comment = 'Run Glacier SQL on Parquet, Iceberg, and a Glacier warehouse'
+default_version = '0.6.2'
+module_pathname = '$libdir/pg_glacier'
+relocatable = true

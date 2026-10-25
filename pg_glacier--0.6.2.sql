@@ -1,0 +1,5 @@
+CREATE FUNCTION glacier_query(path text, sql text)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'pg_glacier_query'
+LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE
+ROWS 1000;
