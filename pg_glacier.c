@@ -29,6 +29,10 @@
 #include "optimizer/pathnode.h"
 #include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
+#include "nodes/bitmapset.h"
+#include "nodes/nodeFuncs.h"
+#include "optimizer/optimizer.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
@@ -40,6 +44,8 @@
 #include "glacier.h"
 
 #include <limits.h>
+#include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 
 PG_MODULE_MAGIC;
@@ -845,6 +851,10 @@ deparse_pg(StringInfo buf, Node *node, Index relid, TupleDesc desc)
 			sqlop = " > ";
 		else if (strcmp(name, ">=") == 0)
 			sqlop = " >= ";
+		else if (strcmp(name, "~~") == 0)
+			sqlop = " LIKE ";
+		else if (strcmp(name, "!~~") == 0)
+			sqlop = " NOT LIKE ";
 		else
 		{
 			pfree(name);
@@ -866,11 +876,87 @@ deparse_pg(StringInfo buf, Node *node, Index relid, TupleDesc desc)
 		pfree(rbuf.data);
 		return ok;
 	}
+	if (IsA(node, ScalarArrayOpExpr))
+	{
+		ScalarArrayOpExpr *sa = (ScalarArrayOpExpr *) node;
+		char	   *name;
+		Node	   *left;
+		Const	   *arrc;
+		ArrayType  *arr;
+		Datum	   *elems;
+		bool	   *nulls;
+		int			nitems;
+		int			i;
+		Oid			elemtype;
+		int16		elmlen;
+		bool		elmbyval;
+		char		elmalign;
+		StringInfoData lbuf;
+		bool		ok;
+
+		if (!sa->useOr || list_length(sa->args) != 2)
+			return false;
+		name = get_opname(sa->opno);
+		if (name == NULL)
+			return false;
+		if (strcmp(name, "=") != 0)
+		{
+			pfree(name);
+			return false;
+		}
+		pfree(name);
+		left = (Node *) linitial(sa->args);
+		if (!IsA(lsecond(sa->args), Const))
+			return false;
+		arrc = (Const *) lsecond(sa->args);
+		if (arrc->constisnull)
+			return false;
+		elemtype = get_element_type(arrc->consttype);
+		if (!OidIsValid(elemtype))
+			return false;
+		get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
+		arr = DatumGetArrayTypeP(arrc->constvalue);
+		deconstruct_array(arr, elemtype, elmlen, elmbyval, elmalign, &elems, &nulls, &nitems);
+		if (nitems <= 0)
+			return false;
+		initStringInfo(&lbuf);
+		ok = deparse_pg(&lbuf, left, relid, desc);
+		if (!ok)
+		{
+			pfree(lbuf.data);
+			return false;
+		}
+		appendStringInfoString(buf, lbuf.data);
+		pfree(lbuf.data);
+		appendStringInfoString(buf, " IN (");
+		for (i = 0; i < nitems; i++)
+		{
+			Const		elem;
+
+			if (i)
+				appendStringInfoString(buf, ", ");
+			if (nulls[i])
+			{
+				appendStringInfoString(buf, "NULL");
+				continue;
+			}
+			memset(&elem, 0, sizeof(elem));
+			elem.xpr.type = T_Const;
+			elem.consttype = elemtype;
+			elem.constvalue = elems[i];
+			elem.constisnull = false;
+			elem.constbyval = elmbyval;
+			if (!append_pg_const(buf, &elem))
+				return false;
+		}
+		appendStringInfoChar(buf, ')');
+		return true;
+	}
 	return false;
 }
 
 static char *
-glacier_table_sql(Oid relid, Relation rel, Index varno, List *scan_clauses)
+glacier_table_sql(Oid relid, Relation rel, Index varno, List *scan_clauses, Bitmapset *attrs)
 {
 	ForeignTable *ft = GetForeignTable(relid);
 	ForeignServer *server = GetForeignServer(ft->serverid);
@@ -896,20 +982,46 @@ glacier_table_sql(Oid relid, Relation rel, Index varno, List *scan_clauses)
 
 	initStringInfo(&sql);
 	appendStringInfoString(&sql, "SELECT ");
-	for (i = 0; i < desc->natts; i++)
+	if (attrs != NULL)
 	{
-		Form_pg_attribute attr = TupleDescAttr(desc, i);
+		int			member = -1;
 
-		if (attr->attisdropped)
-			continue;
-		if (!sql_ident(NameStr(attr->attname)))
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("glacier column names must be letters, digits, and underscores")));
-		if (!first)
-			appendStringInfoString(&sql, ", ");
-		appendStringInfoString(&sql, NameStr(attr->attname));
-		first = false;
+		while ((member = bms_next_member(attrs, member)) >= 0)
+		{
+			AttrNumber	attno = member + FirstLowInvalidHeapAttributeNumber;
+			Form_pg_attribute attr;
+
+			if (attno <= 0 || attno > desc->natts)
+				continue;
+			attr = TupleDescAttr(desc, attno - 1);
+			if (attr->attisdropped)
+				continue;
+			if (!sql_ident(NameStr(attr->attname)))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("glacier column names must be letters, digits, and underscores")));
+			if (!first)
+				appendStringInfoString(&sql, ", ");
+			appendStringInfoString(&sql, NameStr(attr->attname));
+			first = false;
+		}
+	}
+	if (first)
+	{
+		for (i = 0; i < desc->natts; i++)
+		{
+			Form_pg_attribute attr = TupleDescAttr(desc, i);
+
+			if (attr->attisdropped)
+				continue;
+			if (!sql_ident(NameStr(attr->attname)))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("glacier column names must be letters, digits, and underscores")));
+			appendStringInfoString(&sql, NameStr(attr->attname));
+			first = false;
+			break;
+		}
 	}
 	if (first)
 		ereport(ERROR,
@@ -943,12 +1055,223 @@ glacier_table_sql(Oid relid, Relation rel, Index varno, List *scan_clauses)
 	return sql.data;
 }
 
+typedef struct PgTr
+{
+	const unsigned char *p;
+	const unsigned char *end;
+}			PgTr;
+
+static int
+pgtr_varint(PgTr *t, uint64_t *out)
+{
+	uint64_t	n = 0;
+	int			shift = 0;
+
+	while (t->p < t->end && shift <= 63)
+	{
+		unsigned char b = *t->p++;
+
+		n |= (uint64_t) (b & 0x7f) << shift;
+		if ((b & 0x80) == 0)
+		{
+			*out = n;
+			return 0;
+		}
+		shift += 7;
+	}
+	return -1;
+}
+
+static int
+pgtr_skip(PgTr *t, int type);
+
+static int
+pgtr_field(PgTr *t, int *id, int *type)
+{
+	unsigned char b;
+	uint64_t	raw;
+	int64_t		zz;
+
+	if (t->p >= t->end)
+		return -1;
+	b = *t->p++;
+	*type = b & 0x0f;
+	if (*type == 0)
+		return 0;
+	if ((b >> 4) == 0)
+	{
+		if (pgtr_varint(t, &raw) != 0)
+			return -1;
+		zz = (int64_t) ((raw >> 1) ^ (~(raw & 1) + 1));
+		*id = (int) zz;
+	}
+	else
+		*id += b >> 4;
+	return 1;
+}
+
+static int
+pgtr_skip(PgTr *t, int type)
+{
+	uint64_t	n;
+	unsigned char hdr;
+	int			etype;
+	int			vtype;
+	uint64_t	i;
+	int			fid;
+	int			ty;
+	int			rc;
+
+	switch (type)
+	{
+		case 1:
+		case 2:
+			return 0;
+		case 3:
+			if (t->p >= t->end)
+				return -1;
+			t->p++;
+			return 0;
+		case 4:
+		case 5:
+		case 6:
+			return pgtr_varint(t, &n);
+		case 7:
+			if ((size_t) (t->end - t->p) < 8)
+				return -1;
+			t->p += 8;
+			return 0;
+		case 8:
+			if (pgtr_varint(t, &n) != 0)
+				return -1;
+			if (n > (uint64_t) (t->end - t->p))
+				return -1;
+			t->p += n;
+			return 0;
+		case 9:
+		case 10:
+			if (t->p >= t->end)
+				return -1;
+			hdr = *t->p++;
+			etype = hdr & 0x0f;
+			n = hdr >> 4;
+			if (n == 15 && pgtr_varint(t, &n) != 0)
+				return -1;
+			for (i = 0; i < n; i++)
+				if (pgtr_skip(t, etype) != 0)
+					return -1;
+			return 0;
+		case 11:
+			if (pgtr_varint(t, &n) != 0)
+				return -1;
+			if (n == 0)
+				return 0;
+			if (t->p >= t->end)
+				return -1;
+			hdr = *t->p++;
+			etype = hdr >> 4;
+			vtype = hdr & 0x0f;
+			for (i = 0; i < n; i++)
+			{
+				if (pgtr_skip(t, etype) != 0 || pgtr_skip(t, vtype) != 0)
+					return -1;
+			}
+			return 0;
+		case 12:
+			fid = 0;
+			for (;;)
+			{
+				rc = pgtr_field(t, &fid, &ty);
+				if (rc < 0)
+					return -1;
+				if (ty == 0)
+					return 0;
+				if (pgtr_skip(t, ty) != 0)
+					return -1;
+			}
+		default:
+			return -1;
+	}
+}
+
+/* Parquet FileMetaData field 3 is the file row count. Other paths stay at 1000. */
+static double
+parquet_footer_rows(const char *path)
+{
+	FILE	   *f;
+	unsigned char tail[8];
+	uint32_t	flen;
+	unsigned char *buf = NULL;
+	PgTr		tr;
+	int			fid = 0;
+	int			ty;
+	int			rc;
+	uint64_t	raw;
+	int64_t		rows;
+	double		out = -1;
+
+	if (path == NULL)
+		return -1;
+	f = fopen(path, "rb");
+	if (f == NULL)
+		return -1;
+	if (fseek(f, -8, SEEK_END) != 0 || fread(tail, 1, 8, f) != 8)
+		goto done;
+	if (memcmp(tail + 4, "PAR1", 4) != 0)
+		goto done;
+	flen = (uint32_t) tail[0] | ((uint32_t) tail[1] << 8) |
+		((uint32_t) tail[2] << 16) | ((uint32_t) tail[3] << 24);
+	if (flen == 0 || flen > 32 * 1024 * 1024)
+		goto done;
+	buf = (unsigned char *) malloc(flen);
+	if (buf == NULL)
+		goto done;
+	if (fseek(f, -((long) flen + 8), SEEK_END) != 0 || fread(buf, 1, flen, f) != flen)
+		goto done;
+	tr.p = buf;
+	tr.end = buf + flen;
+	for (;;)
+	{
+		rc = pgtr_field(&tr, &fid, &ty);
+		if (rc <= 0)
+			break;
+		if (fid == 3 && ty == 6)
+		{
+			if (pgtr_varint(&tr, &raw) != 0)
+				break;
+			rows = (int64_t) ((raw >> 1) ^ (~(raw & 1) + 1));
+			if (rows >= 0)
+				out = (double) rows;
+			break;
+		}
+		if (pgtr_skip(&tr, ty) != 0)
+			break;
+	}
+done:
+	free(buf);
+	fclose(f);
+	return out;
+}
+
 static void
 glacierGetForeignRelSize(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid)
 {
-	(void) root;
-	(void) foreigntableid;
-	baserel->rows = 1000;
+	ForeignTable *ft = GetForeignTable(foreigntableid);
+	ForeignServer *server = GetForeignServer(ft->serverid);
+	char	   *path = option_value(ft->options, "path");
+	double		rows;
+
+	if (path == NULL)
+		path = option_value(server->options, "path");
+	rows = parquet_footer_rows(path);
+	if (rows < 0)
+		rows = 1000;
+	baserel->tuples = rows;
+	if (baserel->baserestrictinfo != NIL)
+		rows = clamp_row_est(baserel->tuples *
+							 clauselist_selectivity(root, baserel->baserestrictinfo,
+													 0, JOIN_INNER, NULL));
+	baserel->rows = rows;
 }
 
 static void
@@ -975,7 +1298,13 @@ glacierGetForeignPlan(PlannerInfo *root, RelOptInfo *baserel, Oid foreigntableid
 	(void) root;
 	(void) best_path;
 	rel = table_open(foreigntableid, NoLock);
-	sql = glacier_table_sql(foreigntableid, rel, baserel->relid, scan_clauses);
+	{
+		Bitmapset  *attrs = NULL;
+
+		pull_varattnos((Node *) tlist, baserel->relid, &attrs);
+		pull_varattnos((Node *) scan_clauses, baserel->relid, &attrs);
+		sql = glacier_table_sql(foreigntableid, rel, baserel->relid, scan_clauses, attrs);
+	}
 	ft = GetForeignTable(foreigntableid);
 	server = GetForeignServer(ft->serverid);
 	path = option_value(ft->options, "path");
@@ -1098,7 +1427,6 @@ glacierIterateForeignScan(ForeignScanState *node)
 	}
 	{
 		int			natts = desc->natts;
-		int			arrow_col = 0;
 		int			att;
 
 		if (arrow_is_null(&st->batch, st->pos))
@@ -1113,23 +1441,41 @@ glacierIterateForeignScan(ForeignScanState *node)
 		{
 			for (att = 0; att < natts; att++)
 			{
-				if (TupleDescAttr(desc, att)->attisdropped)
+				Form_pg_attribute attr = TupleDescAttr(desc, att);
+				int			col = -1;
+				int			c;
+
+				if (attr->attisdropped)
 				{
 					slot->tts_values[att] = (Datum) 0;
 					slot->tts_isnull[att] = true;
 					continue;
 				}
-				if (st->schema.children == NULL || st->batch.children == NULL ||
-					arrow_col >= st->schema.n_children ||
-					st->schema.children[arrow_col] == NULL ||
-					st->batch.children[arrow_col] == NULL)
-					glacier_fail("Arrow batch is missing a column");
-				slot->tts_values[att] = read_value(st->schema.children[arrow_col],
-												   st->batch.children[arrow_col],
+				if (st->schema.children != NULL)
+				{
+					for (c = 0; c < st->schema.n_children; c++)
+					{
+						if (st->schema.children[c] != NULL &&
+							st->schema.children[c]->name != NULL &&
+							strcmp(st->schema.children[c]->name, NameStr(attr->attname)) == 0)
+						{
+							col = c;
+							break;
+						}
+					}
+				}
+				if (col < 0 || st->batch.children == NULL ||
+					st->batch.children[col] == NULL)
+				{
+					slot->tts_values[att] = (Datum) 0;
+					slot->tts_isnull[att] = true;
+					continue;
+				}
+				slot->tts_values[att] = read_value(st->schema.children[col],
+												   st->batch.children[col],
 												   st->pos,
-												   TupleDescAttr(desc, att)->atttypid,
+												   attr->atttypid,
 												   &slot->tts_isnull[att]);
-				arrow_col++;
 			}
 		}
 		ExecStoreVirtualTuple(slot);

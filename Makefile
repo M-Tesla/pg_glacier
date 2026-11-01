@@ -5,11 +5,12 @@
 
 GLACIER_INCLUDE ?= ../Glacier/include
 GLACIER_LIBDIR ?= ../Glacier/zig-out/lib
+GLACIER_RPATH := $(shell cd "$(GLACIER_LIBDIR)" && pwd)
 PG_CONFIG ?= pg_config
 
 ifeq ($(shell command -v $(PG_CONFIG) >/dev/null 2>&1 && echo yes),yes)
 PG_CPPFLAGS += -I$(GLACIER_INCLUDE)
-SHLIB_LINK += -L$(GLACIER_LIBDIR) -lglacier -Wl,-rpath,'$(abspath $(GLACIER_LIBDIR))'
+SHLIB_LINK += -L$(GLACIER_LIBDIR) -lglacier -Wl,-rpath,'$(GLACIER_RPATH)'
 EXTENSION = pg_glacier
 DATA = pg_glacier--0.6.2.sql pg_glacier--0.6.3.sql pg_glacier--0.6.2--0.6.3.sql
 MODULE_big = pg_glacier
@@ -27,7 +28,7 @@ CPPFLAGS += -I$(PG_SERVER_INCLUDE) -I$(GLACIER_INCLUDE)
 pg_glacier.so: pg_glacier.c $(GLACIER_INCLUDE)/glacier.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -shared -o $@ pg_glacier.c \
 		-L$(GLACIER_LIBDIR) -lglacier \
-		-Wl,-rpath,'$(abspath $(GLACIER_LIBDIR))'
+		-Wl,-rpath,'$(GLACIER_RPATH)'
 
 clean:
 	rm -f pg_glacier.so pg_glacier.o
